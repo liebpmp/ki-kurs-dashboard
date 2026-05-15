@@ -59,17 +59,13 @@
 <div id="dashboard-wrapper"></div>
 
 <script>
-let PAYLOAD = null;
+let KEYS = null;
 
-async function loadPayload() {
-  const resp = await fetch('encrypted-payload.json?v=' + Date.now());
-  PAYLOAD = await resp.json();
+async function loadKeys() {
+  const resp = await fetch('keys.json?v=2');
+  KEYS = await resp.json();
 }
-loadPayload();
-
-function b64ToBytes(b64) {
-  return Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-}
+loadKeys();
 
 async function deriveKey(email, password) {
   const enc = new TextEncoder();
@@ -83,28 +79,11 @@ async function deriveKey(email, password) {
   );
 }
 
-async function decryptMasterKey(email, password) {
-  const userInfo = PAYLOAD.users[email];
-  if (!userInfo) return null;
-  
-  const dk = await deriveKey(email, password);
-  const wrapped = b64ToBytes(userInfo.wrapped);
-  const nonce = b64ToBytes(userInfo.nonce);
-  
-  try {
-    const masterKeyBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: nonce }, dk, wrapped);
-    return new Uint8Array(masterKeyBuf);
-  } catch(e) {
-    return null;
-  }
-}
-
-async function decryptDashboard(masterKeyBytes) {
-  const key = await crypto.subtle.importKey('raw', masterKeyBytes, 'AES-GCM', false, ['decrypt']);
-  const encrypted = b64ToBytes(PAYLOAD.data);
-  const nonce = b64ToBytes(PAYLOAD.nonce);
-  const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: nonce }, key, encrypted);
-  return new TextDecoder().decode(decrypted);
+function b64ToBytes(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
 }
 
 async function doLogin() {
@@ -119,18 +98,36 @@ async function doLogin() {
   btn.disabled = true;
   
   try {
-    if (!PAYLOAD) { await loadPayload(); }
+    if (!KEYS) await loadKeys();
     
-    if (!PAYLOAD.users[email]) {
-      throw new Error('User not found');
-    }
+    const userInfo = KEYS.users[email];
+    if (!userInfo) throw new Error('User not found');
     
-    const masterKey = await decryptMasterKey(email, pw);
-    if (!masterKey) {
-      throw new Error('Wrong password');
-    }
+    // Derive user key
+    const dk = await deriveKey(email, pw);
     
-    const html = await decryptDashboard(masterKey);
+    // Decrypt master key (small data, b64 is fine)
+    const wrapped = b64ToBytes(userInfo.wrapped);
+    const nonce = b64ToBytes(userInfo.nonce);
+    const masterKeyBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: nonce }, dk, wrapped);
+    
+    // Import master key
+    const masterKey = await crypto.subtle.importKey('raw', masterKeyBuf, 'AES-GCM', false, ['decrypt']);
+    
+    // Fetch encrypted dashboard as raw binary (no base64 overhead)
+    loadEl.textContent = 'Lade Dashboard...';
+    const [encResp, nonceResp] = await Promise.all([
+      fetch('dashboard.bin?v=2'),
+      fetch('dashboard.nonce?v=2')
+    ]);
+    const encData = new Uint8Array(await encResp.arrayBuffer());
+    const dataNonce = new Uint8Array(await nonceResp.arrayBuffer());
+    
+    // Decrypt dashboard
+    loadEl.textContent = 'Entschlüssele...';
+    const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: dataNonce }, masterKey, encData);
+    const html = new TextDecoder().decode(decrypted);
+    
     showDashboard(html, email);
   } catch(e) {
     console.error('Login error:', e);
@@ -149,7 +146,6 @@ function showDashboard(html, email) {
   const wrapper = document.getElementById('dashboard-wrapper');
   wrapper.style.display = 'block';
   
-  // Inject dashboard HTML via srcdoc iframe for isolation
   const iframe = document.createElement('iframe');
   iframe.style.cssText = 'width:100%;height:100%;border:none;';
   iframe.srcdoc = html;
