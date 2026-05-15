@@ -18,11 +18,15 @@
   input::placeholder { color: #525252; }
   .btn { width: 100%; padding: 12px; background: linear-gradient(135deg, #3b82f6, #7c3aed); border: none; border-radius: 8px; color: #fff; font-size: 15px; font-weight: 600; cursor: pointer; transition: opacity 0.2s; }
   .btn:hover { opacity: 0.9; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .error { color: #ef4444; font-size: 13px; margin-top: 12px; text-align: center; display: none; }
+  .loading { color: #3b82f6; font-size: 13px; margin-top: 12px; text-align: center; display: none; }
   .footer { text-align: center; margin-top: 24px; color: #525252; font-size: 12px; }
-  #dashboard-frame { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; border: none; z-index: 9999; }
-  .logout-btn { position: fixed; top: 12px; right: 12px; z-index: 10000; background: rgba(0,0,0,0.7); color: #fff; border: 1px solid #333; padding: 6px 14px; border-radius: 6px; font-size: 12px; cursor: pointer; display: none; }
-  .logout-btn:hover { background: rgba(239,68,68,0.8); }
+  .logout-bar { position: fixed; top: 0; left: 0; right: 0; height: 40px; background: rgba(10,10,10,0.95); border-bottom: 1px solid #262626; display: none; align-items: center; justify-content: space-between; padding: 0 16px; z-index: 10000; }
+  .logout-bar span { color: #737373; font-size: 12px; }
+  .logout-bar button { background: transparent; color: #ef4444; border: 1px solid #333; padding: 4px 12px; border-radius: 4px; font-size: 12px; cursor: pointer; }
+  .logout-bar button:hover { background: rgba(239,68,68,0.15); }
+  #dashboard-wrapper { display: none; position: fixed; top: 40px; left: 0; right: 0; bottom: 0; overflow: auto; background: #fff; }
 </style>
 </head>
 <body>
@@ -30,7 +34,7 @@
 <div class="login-container" id="loginBox">
   <div class="logo">
     <h1>📊 KI-Kurs Dashboard</h1>
-    <p>Internes Dashboard — Zugang nur mit Berechtigung</p>
+    <p>AES-256 verschlüsselt — Zugang nur mit Berechtigung</p>
   </div>
   <form onsubmit="return doLogin()">
     <div class="form-group">
@@ -41,62 +45,118 @@
       <label>Passwort</label>
       <input type="password" id="password" placeholder="••••••••" required autocomplete="current-password">
     </div>
-    <button type="submit" class="btn">Anmelden</button>
+    <button type="submit" class="btn" id="loginBtn">Anmelden</button>
     <div class="error" id="error">Ungültige Zugangsdaten. Bitte versuche es erneut.</div>
+    <div class="loading" id="loading">Entschlüssele Dashboard...</div>
   </form>
   <div class="footer">Förderperspektive × Pro Med Performance</div>
 </div>
 
-<iframe id="dashboard-frame" src=""></iframe>
-<button class="logout-btn" id="logoutBtn" onclick="doLogout()">Logout</button>
+<div class="logout-bar" id="logoutBar">
+  <span id="userLabel"></span>
+  <button onclick="doLogout()">Logout</button>
+</div>
+<div id="dashboard-wrapper"></div>
 
 <script>
-const VALID = {
-  "ad73dd25199902ab2064db50eebed49a57a527c1bbdd4a38f920e2dae1409463": 1,
-  "1447a1a732af20cbac4cae9b3bfd3a974f58b796c0c77b7f6d2b60f412eee316": 1,
-  "ca4ca53437307bab3b2a44256ac20aab74a3c4112d1ccb242f97b61b8f9b2ca2": 1,
-  "f64980962c7adcc2314c7eaebeb68cb020da77c506db25df6f937d013af3509d": 1,
-  "f6d52a1e98e2c92b5695f9ef4b6881b260b73e830e147b96d6183d0b74620962": 1
-};
+let PAYLOAD = null;
 
-async function sha256(str) {
-  const buf = new TextEncoder().encode(str);
-  const hash = await crypto.subtle.digest('SHA-256', buf);
-  return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
+async function loadPayload() {
+  const resp = await fetch('encrypted-payload.json');
+  PAYLOAD = await resp.json();
+}
+loadPayload();
+
+function b64ToBytes(b64) {
+  return Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+}
+
+async function deriveKey(email, password) {
+  const enc = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey('raw', enc.encode(email + ':' + password), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt: enc.encode('ki-kurs-salt-2026'), iterations: 100000, hash: 'SHA-256' },
+    keyMaterial,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['decrypt']
+  );
+}
+
+async function decryptMasterKey(email, password) {
+  const userInfo = PAYLOAD.users[email];
+  if (!userInfo) return null;
+  
+  const dk = await deriveKey(email, password);
+  const wrapped = b64ToBytes(userInfo.wrapped);
+  const nonce = b64ToBytes(userInfo.nonce);
+  
+  try {
+    const masterKeyBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: nonce }, dk, wrapped);
+    return new Uint8Array(masterKeyBuf);
+  } catch(e) {
+    return null;
+  }
+}
+
+async function decryptDashboard(masterKeyBytes) {
+  const key = await crypto.subtle.importKey('raw', masterKeyBytes, 'AES-GCM', false, ['decrypt']);
+  const encrypted = b64ToBytes(PAYLOAD.data);
+  const nonce = b64ToBytes(PAYLOAD.nonce);
+  const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: nonce }, key, encrypted);
+  return new TextDecoder().decode(decrypted);
 }
 
 async function doLogin() {
   const email = document.getElementById('email').value.trim().toLowerCase();
   const pw = document.getElementById('password').value;
-  const hash = await sha256(email + ':' + pw);
+  const errEl = document.getElementById('error');
+  const loadEl = document.getElementById('loading');
+  const btn = document.getElementById('loginBtn');
   
-  if (VALID[hash]) {
-    sessionStorage.setItem('auth', hash);
-    showDashboard();
-  } else {
-    document.getElementById('error').style.display = 'block';
+  errEl.style.display = 'none';
+  loadEl.style.display = 'block';
+  btn.disabled = true;
+  
+  if (!PAYLOAD) { await loadPayload(); }
+  
+  const masterKey = await decryptMasterKey(email, pw);
+  if (!masterKey) {
+    loadEl.style.display = 'none';
+    errEl.style.display = 'block';
+    btn.disabled = false;
+    return false;
+  }
+  
+  try {
+    const html = await decryptDashboard(masterKey);
+    showDashboard(html, email);
+  } catch(e) {
+    loadEl.style.display = 'none';
+    errEl.style.display = 'block';
+    btn.disabled = false;
   }
   return false;
 }
 
-function showDashboard() {
+function showDashboard(html, email) {
   document.getElementById('loginBox').style.display = 'none';
-  const frame = document.getElementById('dashboard-frame');
-  frame.src = 'dashboard.html';
-  frame.style.display = 'block';
-  document.getElementById('logoutBtn').style.display = 'block';
+  document.getElementById('logoutBar').style.display = 'flex';
+  document.getElementById('userLabel').textContent = '🔒 ' + email;
+  
+  const wrapper = document.getElementById('dashboard-wrapper');
+  wrapper.style.display = 'block';
+  
+  // Inject dashboard HTML via srcdoc iframe for isolation
+  const iframe = document.createElement('iframe');
+  iframe.style.cssText = 'width:100%;height:100%;border:none;';
+  iframe.srcdoc = html;
+  wrapper.appendChild(iframe);
 }
 
 function doLogout() {
-  sessionStorage.removeItem('auth');
   location.reload();
 }
-
-// Auto-login if session exists
-(async () => {
-  const auth = sessionStorage.getItem('auth');
-  if (auth && VALID[auth]) showDashboard();
-})();
 </script>
 
 </body>
