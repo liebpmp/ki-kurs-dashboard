@@ -62,7 +62,7 @@
 let PAYLOAD = null;
 
 async function loadPayload() {
-  const resp = await fetch('encrypted-payload.json');
+  const resp = await fetch('encrypted-payload.json?v=' + Date.now());
   PAYLOAD = await resp.json();
 }
 loadPayload();
@@ -118,20 +118,22 @@ async function doLogin() {
   loadEl.style.display = 'block';
   btn.disabled = true;
   
-  if (!PAYLOAD) { await loadPayload(); }
-  
-  const masterKey = await decryptMasterKey(email, pw);
-  if (!masterKey) {
-    loadEl.style.display = 'none';
-    errEl.style.display = 'block';
-    btn.disabled = false;
-    return false;
-  }
-  
   try {
+    if (!PAYLOAD) { await loadPayload(); }
+    
+    if (!PAYLOAD.users[email]) {
+      throw new Error('User not found');
+    }
+    
+    const masterKey = await decryptMasterKey(email, pw);
+    if (!masterKey) {
+      throw new Error('Wrong password');
+    }
+    
     const html = await decryptDashboard(masterKey);
     showDashboard(html, email);
   } catch(e) {
+    console.error('Login error:', e);
     loadEl.style.display = 'none';
     errEl.style.display = 'block';
     btn.disabled = false;
